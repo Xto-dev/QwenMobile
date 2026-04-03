@@ -34,6 +34,8 @@ export default function ChatScreen() {
   const [error, setError] = useState<string | null>(null);
   const [isTyping, setIsTyping] = useState(false);
   const [ollamaAvailable, setOllamaAvailable] = useState<boolean | null>(null);
+  const [currentAssistantMessageId, setCurrentAssistantMessageId] = useState<string | null>(null);
+  const [expandedThinking, setExpandedThinking] = useState<string | null>(null);
 
   const flatListRef = useRef<FlatList>(null);
 
@@ -77,6 +79,7 @@ export default function ChatScreen() {
 
     // Создаём placeholder для ответа ассистента
     const assistantMessageId = generateId();
+    setCurrentAssistantMessageId(assistantMessageId);
     setMessages((prev) => [
       ...prev,
       {
@@ -92,20 +95,83 @@ export default function ChatScreen() {
       const apiMessages = [...messages, userMessage];
 
       let accumulatedContent = '';
+      let accumulatedThinking = '';
+      let thinkingStartTime: number | null = null;
+      let thinkingTimedOut = false;
+      const THINKING_TIMEOUT_MS = 600000; // 1 минута
 
       // Streaming запрос к Ollama
-      await streamChatCompletion(apiMessages, (token) => {
-        accumulatedContent += token;
-        
-        // Обновляем сообщение ассистента по мере получения токенов
-        setMessages((prev) =>
-          prev.map((msg) =>
-            msg.id === assistantMessageId
-              ? { ...msg, content: accumulatedContent }
-              : msg
-          )
-        );
-      });
+      await streamChatCompletion(
+        apiMessages,
+        (token) => {
+          accumulatedContent += token;
+          console.log('🔄 Content callback:', {
+            token,
+            totalLength: accumulatedContent.length,
+          });
+          
+          // Обновляем сообщение ассистента по мере получения токенов
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMessageId
+                ? { 
+                    ...msg, 
+                    content: accumulatedContent,
+                  }
+                : msg
+            )
+          );
+        },
+        (thinking) => {
+          // Запускаем таймер при первом размышлении
+          if (!thinkingStartTime) {
+            thinkingStartTime = Date.now();
+          }
+
+          // Проверяем не превышено ли время на размышления
+          const thinkingElapsedMs = Date.now() - thinkingStartTime;
+          if (thinkingElapsedMs > THINKING_TIMEOUT_MS) {
+            // Добавляем индикатор только один раз
+            if (!thinkingTimedOut) {
+              console.log('⏰ Thinking timeout reached!');
+              thinkingTimedOut = true;
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMessageId
+                    ? { 
+                        ...msg, 
+                        thinking: accumulatedThinking + '\n\n⏰ Время размышления истекло (1 минута), модель переходит к ответу...',
+                      }
+                    : msg
+                )
+              );
+            }
+            return; // Игнорируем дальнейшие размышления
+          }
+
+          accumulatedThinking += thinking;
+          console.log('🧠 Thinking callback:', {
+            thinkingLength: thinking.length,
+            totalThinkingLength: accumulatedThinking.length,
+            elapsedSeconds: (thinkingElapsedMs / 1000).toFixed(1),
+            thinkingPreview: thinking.substring(0, 50),
+          });
+          
+          // Обновляем размышления ассистента
+          setMessages((prev) => {
+            const updated = prev.map((msg) =>
+              msg.id === assistantMessageId
+                ? { 
+                    ...msg, 
+                    thinking: accumulatedThinking,
+                  }
+                : msg
+            );
+            console.log('Updated message thinking:', accumulatedThinking.substring(0, 50));
+            return updated;
+          });
+        }
+      );
 
       setIsTyping(false);
     } catch (err) {
@@ -120,11 +186,27 @@ export default function ChatScreen() {
       );
     } finally {
       setLoading(false);
+      setCurrentAssistantMessageId(null);
     }
   };
 
   const renderItem = ({ item }: { item: Message }) => {
     const isUser = item.role === 'user';
+    const hasThinking = item.thinking && item.thinking.trim().length > 0;
+    const isGenerating = currentAssistantMessageId === item.id && isTyping;
+    // Во время генерации размышления развёрнуты, после - следуют правилу expandedThinking
+    const isThinkingExpanded = isGenerating || expandedThinking === item.id;
+    
+    if (!isUser && item.role === 'assistant') {
+      console.log('🎨 Rendering assistant message:', {
+        id: item.id,
+        isGenerating,
+        hasThinking,
+        thinkingLength: item.thinking?.length || 0,
+        contentLength: item.content?.length || 0,
+        thinkingPreview: item.thinking?.substring(0, 50),
+      });
+    }
     
     return (
       <View
@@ -141,8 +223,41 @@ export default function ChatScreen() {
         >
           <Text style={styles.messageRole}>
             {isUser ? 'Вы' : 'Qwen'}
-          </Text>
+          </Text>          
+          {/* Размышления */}
+          {hasThinking && (
+            <>
+              <TouchableOpacity
+                onPress={() => setExpandedThinking(isThinkingExpanded ? null : item.id)}
+                disabled={isGenerating}
+                style={styles.thinkingHeader}
+              >
+                <Text style={styles.thinkingToggle}>
+                  {isThinkingExpanded ? '▼' : '▶'} 💭 Размышления
+                </Text>
+              </TouchableOpacity>
+              
+              {isThinkingExpanded && (
+                <View style={styles.thinkingBox}>
+                  <Text style={styles.thinkingText}>{item.thinking}</Text>
+                  {item.thinking?.includes('⏰ Время размышления истекло') && (
+                    <Text style={styles.thinkingTimeoutText}>
+                      Размышления были ограничены 1 минутой
+                    </Text>
+                  )}
+                </View>
+              )}
+            </>
+          )}
+          {!hasThinking && isGenerating && (
+            <View style={styles.thinkingBox}>
+              <Text style={styles.thinkingText}>💭 Размышляет...</Text>
+            </View>
+          )}
+          
+          {/* Основной контент */}
           <Text style={styles.messageText}>{item.content}</Text>
+          
           <Text style={styles.messageTime}>
             {new Date(item.timestamp).toLocaleTimeString([], {
               hour: '2-digit',
@@ -218,7 +333,7 @@ export default function ChatScreen() {
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
               <Text style={styles.emptyText}>
-                Начните чат с Qwen 2.5 7B!
+                Начните чат с Qwen 3-vl 2B!
               </Text>
               <Text style={styles.emptySubtext}>
                 Убедитесь, что Ollama запущен и модель установлена
@@ -432,5 +547,45 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 20,
     fontWeight: 'bold',
+  },
+  thinkingHeader: {
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    marginBottom: 8,
+  },
+  thinkingToggle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#8B7355',
+  },
+  thinkingBox: {
+    backgroundColor: '#faf8f3',
+    borderLeftWidth: 3,
+    borderLeftColor: '#d4b896',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 8,
+    borderRadius: 6,
+  },
+  thinkingText: {
+    fontSize: 13,
+    color: '#666',
+    lineHeight: 18,
+    fontStyle: 'italic',
+  },
+  thinkingTimeoutText: {
+    fontSize: 12,
+    color: '#d97706',
+    fontWeight: '600',
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#fed7aa',
+  },
+  generatingIndicator: {
+    fontSize: 12,
+    color: '#8B7355',
+    fontStyle: 'italic',
+    marginTop: 6,
   },
 });
